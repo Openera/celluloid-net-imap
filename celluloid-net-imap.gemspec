@@ -6,10 +6,10 @@ require 'celluloid/net/imap/version'
 Gem::Specification.new do |spec|
   spec.name          = "celluloid-net-imap"
   spec.version       = Celluloid::Net::Imap::VERSION
-  spec.authors       = ["Andrew Clunis"]
+  spec.authors       = ["Shugo Maeda", "Andrew Clunis"]
   spec.email         = ["andrew@orospakr.ca"]
-  spec.description   = %q{TODO: Write a gem description}
-  spec.summary       = %q{TODO: Write a gem summary}
+  spec.description   = "A fork of Net::IMAP suitable for use with Celluloid::IO."
+  spec.summary       = "Creates no extra threads!"
   spec.homepage      = ""
   spec.license       = "MIT"
 
