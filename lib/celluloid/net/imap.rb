@@ -2,6 +2,7 @@
 # = net/imap.rb
 #
 # Copyright (C) 2000  Shugo Maeda <shugo@ruby-lang.org>
+#               2013  Openera Inc. <alc@openera.org>
 #
 # This library is distributed under the terms of the Ruby license.
 # You can freely distribute/modify this library.
@@ -13,7 +14,19 @@
 #
 
 
-require "socket"
+# Celluloid::IO async porting notes:
+
+# * have to lose all condvars: they can deadlock with interleaved
+#   Fibers because the thing that will signal them will never be
+#   scheduled
+# * some protocol state/ordering seems to be enforced with condvars :(
+# * how to deliver errors to client code?
+# * would be nice, instead of yielding everywhere, to use line-level
+#   continuations (fibers) like I know C::IO can do, if only to have
+# exceptions work better
+
+
+# require "socket"
 require "monitor"
 require "digest/md5"
 require "strscan"
@@ -22,7 +35,10 @@ begin
 rescue LoadError
 end
 
-module Net
+require "celluloid/tasks"
+require "celluloid/io"
+
+module Celluloid::Net
 
   #
   # Net::IMAP implements Internet Message Access Protocol (IMAP) client
@@ -449,8 +465,10 @@ module Net
     # exist or is for some reason non-selectable.
     def select(mailbox)
       synchronize do
+        # clear any outstanding untagged responses
         @responses.clear
-        send_command("SELECT", mailbox)
+
+        return send_command("SELECT", mailbox)
       end
     end
 
@@ -910,40 +928,30 @@ module Net
     def idle(&response_handler)
       raise LocalJumpError, "no block given" unless response_handler
 
+      # I want to yield multiple items over time
+     
+      # but, I also have to block the coroutine on the handler.
+
+
       response = nil
 
-      synchronize do
-        tag = Thread.current[:net_imap_tag] = generate_tag
-        put_string("#{tag} IDLE#{CRLF}")
+      tag = generate_tag
+      put_string("#{tag} IDLE#{CRLF}")
 
-        begin
-          add_response_handler(response_handler)
-          @idle_done_cond = new_cond
-          @idle_done_cond.wait
-          @idle_done_cond = nil
-          if @receiver_thread_terminating
-            raise Net::IMAP::Error, "connection closed"
-          end
-        ensure
-          unless @receiver_thread_terminating
-            remove_response_handler(response_handler)
-            put_string("DONE#{CRLF}")
-            response = get_tagged_response(tag, "IDLE")
-          end
-        end
+      get_tagged_response(tag, "IDLE") do |response|
+        response_handler.call response
+
+        # TODO: implement the 28 minute timeout for benefit of the API consumer
+        # Do we actually need to terminate IDLE after each arrival?
+        # put_string("DONE#{CRLF}")
+
+        # how can I cancel it?
       end
-
-      return response
     end
 
     # Leaves IDLE.
     def idle_done
-      synchronize do
-        if @idle_done_cond.nil?
-          raise Net::IMAP::Error, "not during IDLE"
-        end
-        @idle_done_cond.signal
-      end
+      raise NotImplementedError
     end
 
     # Decode a string from modified UTF-7 format to UTF-8.
@@ -984,6 +992,14 @@ module Net
     # Formats +time+ as an IMAP-style date-time.
     def self.format_datetime(time)
       return time.strftime('%d-%b-%Y %H:%M %z')
+    end
+
+    def task_worker
+      begin
+        receive_responses
+      rescue Exception => e
+        puts e
+      end
     end
 
     private
@@ -1042,7 +1058,7 @@ module Net
       @tag_prefix = "RUBY"
       @tagno = 0
       @parser = ResponseParser.new
-      @sock = TCPSocket.open(@host, @port)
+      @sock = Celluloid::IO::TCPSocket.open(@host, @port)
       if options[:ssl]
         start_tls_session(options[:ssl])
         @usessl = true
@@ -1051,9 +1067,19 @@ module Net
       end
       @responses = Hash.new([].freeze)
       @tagged_responses = {}
+
+      # handlers that will see *all* responses.
       @response_handlers = []
-      @tagged_response_arrival = new_cond
-      @continuation_request_arrival = new_cond
+
+      # outstanding tags that are being waited for replies
+      # TagID -> ResponseHandler
+      # TODO: Thread safety
+      @outstanding_requests = {}
+
+      # Data queued to to be sent on upcoming continuation requests
+      # (`+` from the server)
+      @queued_continuation_request_data = []
+
       @idle_done_cond = nil
       @logout_command_tag = nil
       @debug_output_bol = true
@@ -1069,15 +1095,13 @@ module Net
         raise ByeResponseError, @greeting
       end
 
-      @client_thread = Thread.current
-      @receiver_thread = Thread.start {
-        begin
-          receive_responses
-        rescue Exception
-        end
-      }
+      # actor.async.wrap {
+      #   
+      # }
       @receiver_thread_terminating = false
     end
+
+
 
     def receive_responses
       connection_closed = false
@@ -1088,6 +1112,7 @@ module Net
         begin
           resp = get_response
         rescue Exception => e
+          puts e
           synchronize do
             @sock.close
             @exception = e
@@ -1104,12 +1129,14 @@ module Net
           synchronize do
             case resp
             when TaggedResponse
-              @tagged_responses[resp.tag] = resp
-              @tagged_response_arrival.broadcast
+              # iterate through all outstanding tagged response
+              @outstanding_requests.delete(resp.tag).call resp
+
               if resp.tag == @logout_command_tag
                 return
               end
             when UntaggedResponse
+              puts "got untagged"
               record_response(resp.name, resp.data)
               if resp.data.instance_of?(ResponseText) &&
                   (code = resp.data.code)
@@ -1121,44 +1148,55 @@ module Net
                 connection_closed = true
               end
             when ContinuationRequest
-              @continuation_request_arrival.signal
+              # write out the next item of queued continuation data
+              # set by the command
+              pump_continuation
             end
             @response_handlers.each do |handler|
+              # call any listeners that have registered to hear about
+              # all incoming replies.
               handler.call(resp)
             end
           end
         rescue Exception => e
           @exception = e
+          puts e
+          puts e.backtrace
           synchronize do
-            @tagged_response_arrival.broadcast
-            @continuation_request_arrival.broadcast
+            # nothing now; not signalling other threads via condvars
+            # to stop waiting
           end
         end
       end
       synchronize do
+        # shutting down!
         @receiver_thread_terminating = true
-        @tagged_response_arrival.broadcast
-        @continuation_request_arrival.broadcast
-        if @idle_done_cond
-          @idle_done_cond.signal
-        end
+        # TODO shut down any IDLE
       end
     end
 
     def get_tagged_response(tag, cmd)
-      until @tagged_responses.key?(tag)
-        raise @exception if @exception
-        @tagged_response_arrival.wait
+
+      # TODO wrap the core connection and response wait list into a thread
+      # safe tiny object?
+
+      task = Celluloid::Task.current
+
+      @outstanding_requests[tag] = lambda do |response|
+
+        # sadly these exceptions aren't delivered to the event
+        # listener.  no good stock pattern for that.
+        case response.name
+        when /\A(?:NO)\z/ni
+          raise NoResponseError, response
+        when /\A(?:BAD)\z/ni
+          raise BadResponseError, response
+        else
+          task.resume(response)
+        end
       end
-      resp = @tagged_responses.delete(tag)
-      case resp.name
-      when /\A(?:NO)\z/ni
-        raise NoResponseError, resp
-      when /\A(?:BAD)\z/ni
-        raise BadResponseError, resp
-      else
-        return resp
-      end
+
+      task.suspend :running
     end
 
     def get_response
@@ -1181,14 +1219,16 @@ module Net
       return @parser.parse(buff)
     end
 
+    # Record an untagged response by its name (command)
     def record_response(name, data)
+      puts "Recording response of type #{name}"
       unless @responses.has_key?(name)
         @responses[name] = []
       end
       @responses[name].push(data)
     end
 
-    def send_command(cmd, *args, &block)
+    def send_command(cmd, *args)
       synchronize do
         args.each do |i|
           validate_data(i)
@@ -1203,16 +1243,8 @@ module Net
         if cmd == "LOGOUT"
           @logout_command_tag = tag
         end
-        if block
-          add_response_handler(block)
-        end
-        begin
-          return get_tagged_response(tag, cmd)
-        ensure
-          if block
-            remove_response_handler(block)
-          end
-        end
+
+        return get_tagged_response(tag, cmd)
       end
     end
 
@@ -1295,9 +1327,20 @@ module Net
 
     def send_literal(str)
       put_string("{" + str.bytesize.to_s + "}" + CRLF)
-      @continuation_request_arrival.wait
+      
+      queue_continuation_request_data(str)
       raise @exception if @exception
-      put_string(str)
+    end
+
+    # Queue up data that should be sent on subsequent `+` continuation
+    # requests from the server.
+    def queue_continuation_request_data(data)
+      @queued_continuation_request_data.push(data)
+    end
+
+    # pump one continuation dataum up the pipe
+    def pump_continuation()
+      put_string(@queued_continuation_request_data.shift)
     end
 
     def send_number_data(num)
@@ -1433,10 +1476,10 @@ module Net
     end
 
     def start_tls_session(params = {})
-      unless defined?(OpenSSL::SSL)
+      unless defined?(Celluloid::IO::SSLSocket)
         raise "SSL extension not installed"
       end
-      if @sock.kind_of?(OpenSSL::SSL::SSLSocket)
+      if @sock.kind_of?(Celluloid::IO::SSLSocket)
         raise RuntimeError, "already using SSL"
       end
       begin
@@ -1444,16 +1487,16 @@ module Net
       rescue NoMethodError
         params = {}
       end
-      context = SSLContext.new
+      context = SSL::SSLContext.new
       context.set_params(params)
       if defined?(VerifyCallbackProc)
         context.verify_callback = VerifyCallbackProc
       end
-      @sock = SSLSocket.new(@sock, context)
-      @sock.sync_close = true
+      @sock = Celluloid::IO::SSLSocket.new(@sock, context)
+      @sock.to_io.sync_close = true
       @sock.connect
       if context.verify_mode != VERIFY_NONE
-        @sock.post_connection_check(@host)
+        @sock.to_io.post_connection_check(@host)
       end
     end
 
