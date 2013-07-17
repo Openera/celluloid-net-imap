@@ -921,31 +921,124 @@ module Celluloid::Net
       return thread_internal("UID THREAD", algorithm, search_keys, charset)
     end
 
-    # Sends an IDLE command that waits for notifications of new or expunged
-    # messages.  Yields responses from the server during the IDLE.
+    # Sends an IDLE command that waits for notifications of new or
+    # expunged messages.  Yields responses from the server
+    # ("untagged") during the IDLE.
+    #
+    # This method blocks (that is, it suspends the Celluloid::IO task
+    # it is run from).
     #
     # Use #idle_done() to leave IDLE.
-    def idle(&response_handler)
-      raise LocalJumpError, "no block given" unless response_handler
+    def idle(&idle_handler)
+      raise LocalJumpError, "no block given" unless idle_handler
 
-      # I want to yield multiple items over time
-     
-      # but, I also have to block the coroutine on the handler.
+      # I do this as a single blocking Task that loops in order to
+      # doing the loop by callback recursion and ultimately causing a
+      # stack explosion after N cycles!
+
+      # TODO There is currently some pretty serious queue ordering issues:
+      # unless the API consumer is very careful to not call commands
+      # at the wrong time, things could get hairily out of order
+      # because the old condvars implemented ordering logic.
+      
 
 
-      response = nil
+      # AS SUCH, we should change the command model from being arbitrarily
+      # added callbacks by methods to an actual FIFO command queue,
+      # and the current command only gets to see untagged responses
+      # and continuation requests.  However, multiple commands can be
+      # in progress, including ones that emit untagged responses (what these belong to is implied 
 
-      tag = generate_tag
-      put_string("#{tag} IDLE#{CRLF}")
+      # The general different messages as per 3501:
 
-      get_tagged_response(tag, "IDLE") do |response|
-        response_handler.call response
+      # * untagged responses
+      #   - solicited: happens after issuing a command that might issue them.  command affinity is known because a prior command has finished and the next queued command has started? prior command completion!
+      #     - there is onl
+      #   - unsolicited: current command does not accept untagged responses
+      #   
+      # * continuation request:
+      #   - currently 
+      #
+      # * tagged response:
+      #   - directly matched by connection-scoped # to the source command.
+      #   - only happens once per command: signifies the delimitation of commands!
+      #     it is from this delimitation that scoping of untagged responses, and
+      #     continuation requests is achieved.
+      # 
 
-        # TODO: implement the 28 minute timeout for benefit of the API consumer
-        # Do we actually need to terminate IDLE after each arrival?
+      # TODO need to handle straight-up TCP disconnection
+
+      # TODO need to handle some way to stop the IDLE (idle_done())
+
+      # TODO: "OK still here" causes bufferring of messages into
+      #       @responses, which isn't cleared until connection
+      #       restart.
+
+      # TODO: exception handling seriously needs improvement from the
+      #       various puts()'s I put in try blocks.
+      
+      # we need to prevent other commands being filed while idle is
+      # running (indeed, this problem exists even just with multiple
+      # tasks calling command requests, outside of just IDLE)... ie.,
+      # command model fix described above needs to be done.
+
+      loop do
+        tag = generate_tag
+        
+
+        task = Celluloid::Task.current
+        
+        handler = lambda do |response|
+          # filter out any tagged responses: IDLE updates are only untagged.
+          if response.instance_of?(UntaggedResponse)
+            idle_handler.call response
+          end
+        end
+
+        add_response_handler handler
+
+        put_string("#{tag} IDLE#{CRLF}")
+
+        # TODO: registering of continuation handlers should be factored
+        # out
+        @outstanding_requests[tag] = lambda do |response|
+          # received the idle terminated message
+          if response.name != "IDLE"
+            raise BadResponseError, "Got #{response.name} response from server's IDLE continuation?"
+          end
+
+          # we're the only thing consuming untagged responses, and and
+          # as such we don't need them buffered up
+          @responses.clear
+
+          # TODO: this is going to cause stack expansion, because
+          # subsequent iterations will pass through this closure,
+          # causing stack nesting
+
+          # yield the task back, and continue back at the resume
+          # task.suspend invocation below (from that t.resume there)
+          task.resume
+        end
+
+        # TODO: implement the 28 minute timeout for benefit of the API
+        # consumer ... also Do we actually need to terminate IDLE
+        # after each arrival?
+
         # put_string("DONE#{CRLF}")
 
-        # how can I cancel it?
+        # TODO: handle the socket straight-up dying
+
+        # how can I cancel it externally?
+
+        
+        # we'll wait for this the IDLE termination handler to be fired before we loop again
+        task.suspend :running
+
+        # ... and now, we got an IDLE termination message.  Thus,
+        # reloop and reengage the request.
+
+        remove_response_handler handler
+
       end
     end
 
@@ -994,6 +1087,17 @@ module Celluloid::Net
       return time.strftime('%d-%b-%Y %H:%M %z')
     end
 
+    # Call this method after instantiating via
+    # Celluloid::Net::IMAP#new.
+    #
+    # This method blocks (that is, it suspends the Celluloid::IO::Task
+    # it is run from) until the IMAP connection is closed.  Call it
+    # inside a method on your C::IO Actor you invoke via `async`.  .
+    #
+    # The purpose is to, in effect, inject a Celluloid Task into this
+    # library (as non-actors cannot directly instantiate Tasks) so it
+    # can block that Task on the IMAP connection's client C::IO
+    # Socket.
     def task_worker
       begin
         receive_responses
@@ -1008,15 +1112,22 @@ module Celluloid::Net
     PORT = 143         # :nodoc:
     SSL_PORT = 993   # :nodoc:
 
-    @@debug = false
+    @@debug = true
     @@authenticators = {}
     @@max_flag_count = 10000
 
     # :call-seq:
-    #    Net::IMAP.new(host, options = {})
+    #    Net::IMAP.new(host, task_delegator, options = {})
     #
     # Creates a new Net::IMAP object and connects it to the specified
-    # +host+.
+    # +host+.  Pass a lambda to +task_delegator+ that itself accepts a
+    # lambda to execute on a Task.  This contrivance is done in order
+    # to allow IMAP to create new Tasks (only top-level Actors obtain
+    # this ability under current Celluloid, so the Actor needs to
+    # delegate this ability).  See README.md for details.
+    #
+    # +actor+. The Celluloid::IO that will be hosting this instance of
+    #          IMAP.
     #
     # +options+ is an option hash, each key of which is a symbol.
     #
@@ -1040,9 +1151,11 @@ module Celluloid::Net
     # SocketError:: hostname not known or other socket error.
     # Net::IMAP::ByeResponseError:: we connected to the host, but they
     #                               immediately said goodbye to us.
-    def initialize(host, port_or_options = {},
+    def initialize(host, task_delegator, actor, port_or_options = {},
                    usessl = false, certs = nil, verify = true)
       super()
+      @task_delegator = task_delegator
+      @actor = actor
       @host = host
       begin
         options = port_or_options.to_hash
@@ -1065,7 +1178,10 @@ module Celluloid::Net
       else
         @usessl = false
       end
+
+      # bufferred up received untagged responses, usually all consumed when a 
       @responses = Hash.new([].freeze)
+
       @tagged_responses = {}
 
       # handlers that will see *all* responses.
@@ -1080,7 +1196,6 @@ module Celluloid::Net
       # (`+` from the server)
       @queued_continuation_request_data = []
 
-      @idle_done_cond = nil
       @logout_command_tag = nil
       @debug_output_bol = true
       @exception = nil
@@ -1099,9 +1214,19 @@ module Celluloid::Net
       #   
       # }
       @receiver_thread_terminating = false
+
+      create_task do
+        begin
+          receive_responses
+        rescue Exception => e
+          puts e
+        end
+      end
     end
 
-
+    def create_task
+      @task_delegator.call { yield }
+    end
 
     def receive_responses
       connection_closed = false
@@ -1340,7 +1465,11 @@ module Celluloid::Net
 
     # pump one continuation dataum up the pipe
     def pump_continuation()
-      put_string(@queued_continuation_request_data.shift)
+      r = @queued_continuation_request_data.shift
+      if not r.nil?
+        # Only pump if there are queued data items for continuation.
+        put_string(r)
+      end
     end
 
     def send_number_data(num)
