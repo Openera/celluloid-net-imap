@@ -13,8 +13,12 @@ class TestListener
 #    async.attach_to_imap
     kerblam
 
-    after 5 do 
-      puts "TL tick: " + Thread.current.inspect
+    every 1 do 
+      # HACK: Without this timer up here, other timers created in
+      # other contexts may not fire.  It appears that I've run into a
+      # bug in Celluloid::Timers.
+
+      # puts "TL tick: #{Kernel.caller.length}"
     end
   end
 
@@ -25,10 +29,10 @@ class TestListener
 
   def restart_imap
     puts "Restarting IMAP in a few seconds..."
-
-      puts "ACTIVATE"
+    after 3 do
+      puts "Re-activating... stack count: #{Kernel.caller.inspect}"
       async.attach_to_imap
-
+    end
   end
 
   def attach_to_imap

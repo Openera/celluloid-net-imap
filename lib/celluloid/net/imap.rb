@@ -1210,6 +1210,8 @@ module Celluloid::Net
       @task_delegator.call { yield }
     end
 
+    # Waits for replies from the IMAP server and delegates responses
+    # as required.  Blocks the current task.
     def receive_responses
       connection_closed = false
       until connection_closed
