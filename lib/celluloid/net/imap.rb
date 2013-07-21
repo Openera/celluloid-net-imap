@@ -339,10 +339,8 @@ module Celluloid::Net
         end
       rescue Errno::ENOTCONN
         # ignore `Errno::ENOTCONN: Socket is not connected' on some platforms.
-      rescue Exception => e
-        @receiver_thread.raise(e)
       end
-      @receiver_thread.join
+      # TODO: our task blocking on a read; what's happening to it?
       synchronize do
         unless @sock.closed?
           @sock.close
@@ -1011,9 +1009,11 @@ module Celluloid::Net
           # as such we don't need them buffered up
           @responses.clear
 
-          # TODO: this is going to cause stack expansion, because
+          # TODO: is this is going to cause stack expansion, because
           # subsequent iterations will pass through this closure,
-          # causing stack nesting
+          # causing stack nesting?  depends if nested Fiber.resume-ing
+          # is going to add stack frames (fibers have their own
+          # stacks)
 
           # yield the task back, and continue back at the resume
           # task.suspend invocation below (from that t.resume there)
@@ -1087,25 +1087,6 @@ module Celluloid::Net
       return time.strftime('%d-%b-%Y %H:%M %z')
     end
 
-    # Call this method after instantiating via
-    # Celluloid::Net::IMAP#new.
-    #
-    # This method blocks (that is, it suspends the Celluloid::IO::Task
-    # it is run from) until the IMAP connection is closed.  Call it
-    # inside a method on your C::IO Actor you invoke via `async`.  .
-    #
-    # The purpose is to, in effect, inject a Celluloid Task into this
-    # library (as non-actors cannot directly instantiate Tasks) so it
-    # can block that Task on the IMAP connection's client C::IO
-    # Socket.
-    def task_worker
-      begin
-        receive_responses
-      rescue Exception => e
-        puts e
-      end
-    end
-
     private
 
     CRLF = "\r\n"      # :nodoc:
@@ -1152,9 +1133,10 @@ module Celluloid::Net
     # Net::IMAP::ByeResponseError:: we connected to the host, but they
     #                               immediately said goodbye to us.
     def initialize(host, task_delegator, actor, port_or_options = {},
-                   usessl = false, certs = nil, verify = true)
+                   usessl = false, certs = nil, verify = true, &closed_handler)
       super()
       @task_delegator = task_delegator
+      @closed_handler = closed_handler
       @actor = actor
       @host = host
       begin
@@ -1219,7 +1201,7 @@ module Celluloid::Net
         begin
           receive_responses
         rescue Exception => e
-          puts e
+          @closed_handler.call(e)
         end
       end
     end
@@ -1237,17 +1219,14 @@ module Celluloid::Net
         begin
           resp = get_response
         rescue Exception => e
-          puts e
           synchronize do
             @sock.close
-            @exception = e
+            raise e
           end
           break
         end
         unless resp
-          synchronize do
-            @exception = EOFError.new("end of file reached")
-          end
+          raise EOFError.new("end of file reached")
           break
         end
         begin
@@ -1325,9 +1304,12 @@ module Celluloid::Net
     end
 
     def get_response
+      puts "Iterating get_response"
       buff = ""
       while true
+        puts "Waiting on read..."
         s = @sock.gets(CRLF)
+        puts "... read completed"
         break unless s
         buff.concat(s)
         if /\{(\d+)\}\r\n/n =~ s

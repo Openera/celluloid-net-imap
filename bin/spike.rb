@@ -12,6 +12,10 @@ class TestListener
   def initialize
 #    async.attach_to_imap
     kerblam
+
+    after 5 do 
+      puts "TL tick: " + Thread.current.inspect
+    end
   end
 
   # have to use this because Actor#async doesn't accept blocks.
@@ -19,13 +23,30 @@ class TestListener
     block.call
   end
 
+  def restart_imap
+    puts "Restarting IMAP in a few seconds..."
+
+      puts "ACTIVATE"
+      async.attach_to_imap
+
+  end
+
   def attach_to_imap
     puts "STARTING"
     task_delegator = lambda do |&block|
       async.delegate_new_task block
     end
-    conn = Celluloid::Net::IMAP.new("localhost", task_delegator, self, ssl: false)
-    # async.listen_to_imap conn
+    begin
+      conn = Celluloid::Net::IMAP.new("localhost", task_delegator, self, ssl: false) do |close_reason|
+        puts "Connection dropped!"
+        restart_imap
+      end
+    rescue Exception => e
+      puts "Unable to establish IMAP connection because of #{e}"
+      restart_imap
+      return
+    end
+
     puts "LISTENER KICKED OFF"
     puts conn.capability.inspect
     conn.login("orospakr", "PASSWOID")
@@ -72,7 +93,9 @@ class TestListener
       # 3. when timer goes ding at 29 minutes  
 
   def kerblam
-    30.times do
+
+
+    1.times do
       async.attach_to_imap
     end
   end
