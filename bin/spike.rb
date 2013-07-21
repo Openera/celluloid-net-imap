@@ -4,13 +4,10 @@ require "celluloid/io"
 
 require "celluloid/net/imap"
 
-puts "weenis"
-
 class TestListener
   include Celluloid::IO
 
   def initialize
-#    async.attach_to_imap
     kerblam
 
     every 1 do 
@@ -52,21 +49,33 @@ class TestListener
     end
 
     puts "LISTENER KICKED OFF"
-    puts conn.capability.inspect
-    conn.login("orospakr", "PASSWOID")
-    puts conn.select('INBOX')
-    # email_uids = conn.search(["NOT", "DELETED"])
-    # email_uids.each do |message_id|
-    #   puts "wat: #{message_id}"
-    #   puts "Envelope: #{(conn.fetch message_id, "ENVELOPE")[0]}"
-    #   puts (conn.fetch message_id, "BODYSTRUCTURE")[0].attr["BODYSTRUCTURE"].inspect   
-    # end
 
-    # puts "You have #{email_uids.length} messages in your INBOX."
+    # puts conn.capability.inspect
+    begin
+      conn.login("orospakr", "PASSWOID")
 
-    conn.idle do |idle_msg|
-      puts "GOT IDLE MESSAGE: #{idle_msg.inspect}"
+      puts conn.select('INBOX')
+
+      # email_uids = conn.search(["NOT", "DELETED"])
+      # email_uids.each do |message_id|
+      #   puts "wat: #{message_id}"
+      #   puts "Envelope: #{(conn.fetch message_id, "ENVELOPE")[0]}"
+      #   puts (conn.fetch message_id, "BODYSTRUCTURE")[0].attr["BODYSTRUCTURE"].inspect   
+      # end
+
+      # puts "You have #{email_uids.length} messages in your INBOX."
+
+      conn.idle do |idle_msg|
+        puts "GOT IDLE MESSAGE: #{idle_msg.inspect}"
+      end
+    rescue Exception => e
+      puts "Command error (auth?), restarting: #{e}"
+
+      # disconnecting will trigger a reconnect for us
+      conn.disconnect
     end
+
+
 
     # puts "Idle handler installed."
 
@@ -97,8 +106,6 @@ class TestListener
       # 3. when timer goes ding at 29 minutes  
 
   def kerblam
-
-
     1.times do
       async.attach_to_imap
     end

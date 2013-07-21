@@ -332,10 +332,10 @@ module Celluloid::Net
       begin
         begin
           # try to call SSL::SSLSocket#io.
-          @sock.io.shutdown
+          @sock.io.close
         rescue NoMethodError
           # @sock is not an SSL::SSLSocket.
-          @sock.shutdown
+          @sock.close
         end
       rescue Errno::ENOTCONN
         # ignore `Errno::ENOTCONN: Socket is not connected' on some platforms.
@@ -346,7 +346,6 @@ module Celluloid::Net
           @sock.close
         end
       end
-      raise e if e
     end
 
     # Returns true if disconnected from the server.
@@ -1266,8 +1265,11 @@ module Celluloid::Net
           end
         rescue Exception => e
           @exception = e
-          puts e
-          puts e.backtrace
+          puts "Unmanageable connection problem: #{e} - #{e.backtrace.join "\n"}"
+          # puts e.backtrace
+          # Any unhandled exceptions should cause the connection to
+          # fail.
+          raise e
           synchronize do
             # nothing now; not signalling other threads via condvars
             # to stop waiting
@@ -1290,13 +1292,14 @@ module Celluloid::Net
 
       @outstanding_requests[tag] = lambda do |response|
 
-        # sadly these exceptions aren't delivered to the event
-        # listener.  no good stock pattern for that.
+        # TODO sadly these exceptions aren't delivered to the event
+        # listener.  no good stock pattern for that.  can Task deliver
+        # them?
         case response.name
         when /\A(?:NO)\z/ni
-          raise NoResponseError, response
+          task.resume NoResponseError.new response
         when /\A(?:BAD)\z/ni
-          raise BadResponseError, response
+          task.resume BadResponseError.new response
         else
           task.resume(response)
         end
@@ -1338,7 +1341,6 @@ module Celluloid::Net
     end
 
     def send_command(cmd, *args)
-      synchronize do
         args.each do |i|
           validate_data(i)
         end
@@ -1353,8 +1355,13 @@ module Celluloid::Net
           @logout_command_tag = tag
         end
 
-        return get_tagged_response(tag, cmd)
-      end
+        results = get_tagged_response(tag, cmd)
+        if results.kind_of? Error
+          puts "COMMAND EXCEPTION, DELIVERING"
+          raise results
+          return nil
+        end
+        return results
     end
 
     def generate_tag
