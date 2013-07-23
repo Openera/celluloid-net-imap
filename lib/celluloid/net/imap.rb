@@ -13,6 +13,9 @@
 # See Net::IMAP for documentation.
 #
 
+# Require the stock Net::IMAP in order to borrow some types from it.
+require "net/imap"
+
 
 # Celluloid::IO async porting notes:
 
@@ -341,6 +344,8 @@ module Celluloid::Net
         # ignore `Errno::ENOTCONN: Socket is not connected' on some platforms.
       end
       # TODO: our task blocking on a read; what's happening to it?
+      # (register a callback that resumes and quits out the task
+      # blocked in receive_responses)
       synchronize do
         unless @sock.closed?
           @sock.close
@@ -1295,6 +1300,10 @@ module Celluloid::Net
         # TODO sadly these exceptions aren't delivered to the event
         # listener.  no good stock pattern for that.  can Task deliver
         # them?
+
+        # TODO: looks like the response object here sometimes lacks
+        # the "data" field, breaking the Response instantiation.
+        # example: try starting IDLE before LOGIN
         case response.name
         when /\A(?:NO)\z/ni
           task.resume NoResponseError.new response
@@ -3704,48 +3713,55 @@ module Celluloid::Net
     add_authenticator "DIGEST-MD5", DigestMD5Authenticator
 
     # Superclass of IMAP errors.
-    class Error < StandardError
-    end
+    Error = ::Net::IMAP::Error
+    # class Error < StandardError
+    # end
 
     # Error raised when data is in the incorrect format.
-    class DataFormatError < Error
-    end
+    DataFormatError = ::Net::IMAP::DataFormatError
+    # class DataFormatError < Error
+    # end
 
     # Error raised when a response from the server is non-parseable.
-    class ResponseParseError < Error
-    end
+    ResponseParseError = ::Net::IMAP::ResponseParseError
+    # class ResponseParseError < Error
+    # end
 
     # Superclass of all errors used to encapsulate "fail" responses
     # from the server.
-    class ResponseError < Error
+    ResponseError = ::Net::IMAP::ResponseError
+    # class ResponseError < Error
 
-      # The response that caused this error
-      attr_accessor :response
+    #   # The response that caused this error
+    #   attr_accessor :response
 
-      def initialize(response)
-        @response = response
+    #   def initialize(response)
+    #     @response = response
 
-        super @response.data.text
-      end
+    #     super @response.data.text
+    #   end
 
-    end
+    # end
 
     # Error raised upon a "NO" response from the server, indicating
     # that the client command could not be completed successfully.
-    class NoResponseError < ResponseError
-    end
+    NoResponseError = ::Net::IMAP::NoResponseError
+    # class NoResponseError < ResponseError
+    # end
 
     # Error raised upon a "BAD" response from the server, indicating
     # that the client command violated the IMAP protocol, or an internal
     # server failure has occurred.
-    class BadResponseError < ResponseError
-    end
+    BadResponseError = ::Net::IMAP::BadResponseError
+    # class BadResponseError < ResponseError
+    # end
 
     # Error raised upon a "BYE" response from the server, indicating
     # that the client is not being allowed to login, or has been timed
     # out due to inactivity.
-    class ByeResponseError < ResponseError
-    end
+    ByeResponseError = ::Net::IMAP::ByeResponseError
+    # class ByeResponseError < ResponseError
+    # end
 
     # Error raised when too many flags are interned to symbols.
     class FlagCountError < Error
