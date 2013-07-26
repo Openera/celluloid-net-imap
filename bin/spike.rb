@@ -15,7 +15,7 @@ class TestListener
       # other contexts may not fire.  It appears that I've run into a
       # bug in Celluloid::Timers.
 
-      # puts "TL tick: #{Kernel.caller.length}"
+      puts "TL tick: #{Kernel.caller.length}"
     end
   end
 
@@ -33,27 +33,30 @@ class TestListener
   end
 
   def attach_to_imap
-    puts "STARTING"
+    puts "Attempting to connect to IMAP..."
     task_delegator = lambda do |&block|
       async.delegate_new_task block
     end
     begin
-      conn = Celluloid::Net::IMAP.new("localhost", task_delegator, self, ssl: false) do |close_reason|
+      conn = Celluloid::Net::IMAP.new("localhost", task_delegator, self, ssl: false, port: 5143) do |close_reason|
         puts "Connection dropped!"
         restart_imap
       end
-    rescue Exception => e
+      # TODO: the exception rescue should become IMAP specific
+      # (connection error, command errors)
+    rescue Celluloid::Net::IMAP::Error => e
       puts "Unable to establish IMAP connection because of #{e}"
       restart_imap
       return
     end
 
-    puts "LISTENER KICKED OFF"
+    puts "... Connection open!"
 
-    # puts conn.capability.inspect
     begin
-      conn.login("orospakr", "PASSWOID")
-
+      puts "Logging in..."
+      conn.login("alc@openera.com", "PASSWOID")
+      puts "... success!"
+      
       puts conn.select('INBOX')
 
       # email_uids = conn.search(["NOT", "DELETED"])
@@ -69,42 +72,18 @@ class TestListener
         puts "GOT IDLE MESSAGE: #{idle_msg.inspect}"
       end
     rescue Exception => e
-      puts "Command error (auth?), restarting: #{e}"
+      puts "Command error (auth?), (restarting): #{e}, #{e.backtrace}"
 
-      # disconnecting will trigger a reconnect for us
+      # See the HACK block in #receive_response.  The decision to
+      # delegate the decision to shutdown the IMAP connection in case
+      # of error cannot be delegated until a Celluloid::IO issue is
+      # solved.
+
+      # disconnecting WOULD trigger a reconnect for us
       conn.disconnect
     end
-
-
-
-    # puts "Idle handler installed."
-
-    # # conn.idle do |idle_msg|
-    # #   puts idle_msg.inspect
-    # # end
-
-    # puts "Idling!"
   end
-
-      # IDLE lifecycle:
-
-      # 0. Select mailbox
-
-      # Begin listening.  We're doing a naiive best-effort hint of
-      # updates, so just whenever we see an EXISTS do an update
-
-      # 1. Check our UID validity (same as synchronous client in our
-      #    Rails app does), if different, schedule a backwards (?) update.  When does the IMAP idle start up again?  
-
-      # 1. get max UID of the mailbox (that is our current level; if it's newer than the current max UID
-
-      # 1. wait on IDLE
-
-      # 2. wait for untagged responses (and send those untagged
-      #    responses to the callback)
-
-      # 3. when timer goes ding at 29 minutes  
-
+ 
   def kerblam
     1.times do
       async.attach_to_imap

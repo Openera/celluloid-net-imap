@@ -332,6 +332,7 @@ module Celluloid::Net
 
     # Disconnects from the server.
     def disconnect
+      puts "Disconnecting." if @@debug
       begin
         begin
           # try to call SSL::SSLSocket#io.
@@ -346,11 +347,8 @@ module Celluloid::Net
       # TODO: our task blocking on a read; what's happening to it?
       # (register a callback that resumes and quits out the task
       # blocked in receive_responses)
-      synchronize do
-        unless @sock.closed?
-          @sock.close
-        end
-      end
+  
+      puts "Disconnect complete!"
     end
 
     # Returns true if disconnected from the server.
@@ -428,19 +426,23 @@ module Celluloid::Net
     # A Net::IMAP::NoResponseError is raised if authentication fails.
     def authenticate(auth_type, *args)
       auth_type = auth_type.upcase
+      puts "AUTHENTICATORS LOL: "
+      puts @@authenticators.inspect
+
       unless @@authenticators.has_key?(auth_type)
         raise ArgumentError,
           format('unknown auth type - "%s"', auth_type)
       end
       authenticator = @@authenticators[auth_type].new(*args)
-      send_command("AUTHENTICATE", auth_type) do |resp|
-        if resp.instance_of?(ContinuationRequest)
-          data = authenticator.process(resp.data.text.unpack("m")[0])
-          s = [data].pack("m").gsub(/\n/, "")
-          send_string_data(s)
-          put_string(CRLF)
-        end
-      end
+      # TODO: because of the continuation request pump method I put
+      # in, the client code is not able to receive any data included
+      # with the continuation request.  Thankfully, all of the auth
+      # methods we use (I suspect CRAM-MD5 is the only one) don't need
+      # it, hence `nil'.
+      auth_data = authenticator.process(nil)
+      base64_packed = [auth_data].pack("m").gsub(/\n/, "")
+      queue_continuation_request_data(base64_packed)
+      send_command("AUTHENTICATE", auth_type)
     end
 
     # Sends a LOGIN command to identify the client and carries
@@ -1139,6 +1141,11 @@ module Celluloid::Net
     def initialize(host, task_delegator, actor, port_or_options = {},
                    usessl = false, certs = nil, verify = true, &closed_handler)
       super()
+      begin
+        ct = Celluloid::Task.current
+      rescue Celluloid::NotTaskError
+        raise "Celluloid::Net::IMAP must be used within a Celluloid::IO enabled reactor."
+      end
       @task_delegator = task_delegator
       @closed_handler = closed_handler
       @actor = actor
@@ -1157,7 +1164,11 @@ module Celluloid::Net
       @tag_prefix = "RUBY"
       @tagno = 0
       @parser = ResponseParser.new
-      @sock = Celluloid::IO::TCPSocket.open(@host, @port)
+      begin
+        @sock = Celluloid::IO::TCPSocket.open(@host, @port)
+      rescue Resolv::ResolvError, SystemCallError, SocketError => e
+        raise NetworkError, e
+      end
       if options[:ssl]
         start_tls_session(options[:ssl])
         @usessl = true
@@ -1204,10 +1215,15 @@ module Celluloid::Net
       create_task do
         begin
           receive_responses
-        rescue Exception => e
+          # if receive_responses exits, then consider the connection dead
+          disconnect
           @closed_handler.call(e)
-        end
-      end
+        rescue Exception => e
+          puts e
+          # disconnect
+          @closed_handler.call(e)
+         end
+       end
     end
 
     def create_task
@@ -1217,6 +1233,7 @@ module Celluloid::Net
     # Waits for replies from the IMAP server and delegates responses
     # as required.  Blocks the current task.
     def receive_responses
+      puts "Entering receive_responses!" if @@debug
       connection_closed = false
       until connection_closed
         synchronize do
@@ -1239,23 +1256,67 @@ module Celluloid::Net
           synchronize do
             case resp
             when TaggedResponse
-              # iterate through all outstanding tagged response
-              @outstanding_requests.delete(resp.tag).call resp
+              outstanding = @outstanding_requests.delete(resp.tag)
 
+              outstanding.call resp
+
+              # OPTIONAL HACK If client code in another task tries to
+              # close the connection, receive_responses may stay
+              # waiting foreer.  However, In order to work around
+              # https://github.com/celluloid/celluloid-io/issues/79 ,
+              # we have to just make some default behaviour of canning
+              # the connection because having the client code do it
+              # (which is necessarily on another task, because
+              # #receive_responses() would otherwise remain blocked
+              # forever.  As such, the below hack notices such error
+              # messages, closes the connection, and exits
+              #
+              # receive_responses().
+              # case resp.name
+              # when /\A(?:NO)\z/ni
+              #   puts "Dropping connection because of NO!" if @@debug
+              #   disconnect
+              #   return
+              # when /\A(?:BAD)\z/ni
+              #   puts "Dropping connection because of BAD!" if @@debug
+              #   disconnect
+              #   return
+              # end
+
+              # another concern: if C::IO's sock.close is called twice, it can
+              # block!
+
+              # how it currently works: the user closed callback code
+              # is be run right inside the receive_responses Task,
+              # which therefore will not reenter the sock.gets until
+              # the user callback code is completed.  If the user
+              # callbacks called #disconnect, the next iteration of
+              # receive_responses would read from a closed socket,
+              # causing an immediate error which would allow
+              # receive_responses to break out and the closed handler
+              # to be called!
+
+              # As such, the case I spoke about above can still happen, but
+              # only if some other code (which is not happening as a
+              # result of a direct callback to user code by something
+              # not on the receive respones task, which is rare.
+              # thus, I do not need to solve it until The Great
+              # Refactor.
+              
               if resp.tag == @logout_command_tag
                 return
               end
             when UntaggedResponse
-              puts "got untagged"
+              puts "got untagged" if @@debug
               record_response(resp.name, resp.data)
               if resp.data.instance_of?(ResponseText) &&
                   (code = resp.data.code)
                 record_response(code.name, code.data)
               end
               if resp.name == "BYE" && @logout_command_tag.nil?
-                @sock.close
-                @exception = ByeResponseError.new(resp)
                 connection_closed = true
+                disconnect
+                @exception = ByeResponseError.new(resp)
               end
             when ContinuationRequest
               # write out the next item of queued continuation data
@@ -1271,15 +1332,10 @@ module Celluloid::Net
         rescue Exception => e
           @exception = e
           puts "Unmanageable connection problem: #{e} - #{e.backtrace.join "\n"}"
-          # puts e.backtrace
           # Any unhandled exceptions should cause the connection to
           # fail.
           raise e
-          synchronize do
-            # nothing now; not signalling other threads via condvars
-            # to stop waiting
-          end
-        end
+         end
       end
       synchronize do
         # shutting down!
@@ -1291,16 +1347,11 @@ module Celluloid::Net
     def get_tagged_response(tag, cmd)
 
       # TODO wrap the core connection and response wait list into a thread
-      # safe tiny object?
+      # safe tiny object?  The great refactor!
 
       task = Celluloid::Task.current
 
       @outstanding_requests[tag] = lambda do |response|
-
-        # TODO sadly these exceptions aren't delivered to the event
-        # listener.  no good stock pattern for that.  can Task deliver
-        # them?
-
         # TODO: looks like the response object here sometimes lacks
         # the "data" field, breaking the Response instantiation.
         # example: try starting IDLE before LOGIN
@@ -1318,12 +1369,12 @@ module Celluloid::Net
     end
 
     def get_response
-      puts "Iterating get_response"
+      puts "Iterating get_response" if @@debug
       buff = ""
       while true
-        puts "Waiting on read..."
+        puts "Waiting on read..." if @@debug
         s = @sock.gets(CRLF)
-        puts "... read completed"
+        puts "... read completed" if @@debug
         break unless s
         buff.concat(s)
         if /\{(\d+)\}\r\n/n =~ s
@@ -1342,7 +1393,7 @@ module Celluloid::Net
 
     # Record an untagged response by its name (command)
     def record_response(name, data)
-      puts "Recording response of type #{name}"
+      puts "Recording response of type #{name}" if @@debug
       unless @responses.has_key?(name)
         @responses[name] = []
       end
@@ -1370,7 +1421,7 @@ module Celluloid::Net
           raise results
           return nil
         end
-        return results
+      return results
     end
 
     def generate_tag
@@ -1463,12 +1514,15 @@ module Celluloid::Net
       @queued_continuation_request_data.push(data)
     end
 
-    # pump one continuation dataum up the pipe
+    # pump one continuation dataum up the pipe.
+    #
+    # TODO: this arrangement does not make the rest of the
+    # continuation request message available to the producer of it.
     def pump_continuation()
       r = @queued_continuation_request_data.shift
       if not r.nil?
         # Only pump if there are queued data items for continuation.
-        put_string(r)
+        put_string("#{r}#{CRLF}")
       end
     end
 
@@ -3716,6 +3770,12 @@ module Celluloid::Net
     Error = ::Net::IMAP::Error
     # class Error < StandardError
     # end
+
+    # For some reason, Net::IMAP contains no exception for layer 4 and
+    # below errors, and Ruby has a plethora of them, making it awkward
+    # to handle them in the client code.
+    class NetworkError < ::Net::IMAP::Error
+    end
 
     # Error raised when data is in the incorrect format.
     DataFormatError = ::Net::IMAP::DataFormatError
