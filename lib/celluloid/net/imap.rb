@@ -436,7 +436,7 @@ module Celluloid::Net
     # A Net::IMAP::NoResponseError is raised if authentication fails.
     def authenticate(auth_type, *args)
       auth_type = auth_type.upcase
-      puts "AUTHENTICATORS LOL: "
+      puts "AUTHENTICATORS DUMP: " if @@debug
       puts @@authenticators.inspect
 
       unless @@authenticators.has_key?(auth_type)
@@ -997,7 +997,7 @@ module Celluloid::Net
       # command model fix described above needs to be done.
 
       loop do
-        puts "IDLE looping..."
+        puts "IDLE looping..." if @@debug
         tag = generate_tag
         
         task = Celluloid::Task.current
