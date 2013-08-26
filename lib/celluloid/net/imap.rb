@@ -349,6 +349,14 @@ module Celluloid::Net
       # TODO: our task blocking on a read; what's happening to it?
       # (register a callback that resumes and quits out the task
       # blocked in receive_responses)
+
+      # stop all blocked tasks waiting for commands to complete.
+      # their world is over.
+      @outstanding_requests.values.each do |outstanding_cb|
+        outstanding_cb.call(nil)
+      end
+
+      @outstanding_requests.clear
   
       puts "Disconnect complete!"
     end
@@ -1125,7 +1133,7 @@ module Celluloid::Net
     PORT = 143         # :nodoc:
     SSL_PORT = 993   # :nodoc:
 
-    @@debug = true
+    @@debug = false
     @@authenticators = {}
     @@max_flag_count = 10000
 
@@ -1270,7 +1278,7 @@ module Celluloid::Net
           resp = get_response
         rescue Exception => e
           synchronize do
-            puts "CLOSING SOCKET - 1"
+            puts "CLOSING SOCKET - 1" if @@debug
             @sock.close
             raise e
           end
@@ -1286,9 +1294,9 @@ module Celluloid::Net
             when TaggedResponse
               outstanding = @outstanding_requests.delete(resp.tag)
 
-              puts "CALLING OUTSTANDING RESPONSE #{outstanding}"
+              puts "CALLING OUTSTANDING RESPONSE #{outstanding}" if @@debug
               outstanding.call resp
-              puts "FINISHED CALLING OUTSTANDING"
+              puts "FINISHED CALLING OUTSTANDING" if @@debug
 
               # OPTIONAL HACK If client code in another task tries to
               # close the connection, receive_responses may stay
@@ -1383,13 +1391,14 @@ module Celluloid::Net
 
       task = Celluloid::Task.current
 
-      begin
-
-        @outstanding_requests[tag] = lambda do |response|
-          # TODO: looks like the response object here sometimes lacks
-          # the "data" field, breaking the Response instantiation.
-          # example: try starting IDLE before LOGIN
-          puts "OUTSTANDING RESPONSE HANDLER HIT: #{response}"
+      @outstanding_requests[tag] = lambda do |response|
+        # TODO: looks like the response object here sometimes lacks
+        # the "data" field, breaking the Response instantiation.
+        # example: try starting IDLE before LOGIN
+        puts "OUTSTANDING RESPONSE HANDLER HIT: #{response}" if @@debug
+        if response.nil?
+          task.resume(nil)
+        else
           case response.name
           when /\A(?:NO)\z/ni
             task.resume NoResponseError.new(response)
@@ -1400,12 +1409,14 @@ module Celluloid::Net
             task.resume(response)
           end
         end
-
-      rescue Exception => e
-        task.resume(e)
       end
 
-      task.suspend :running
+      r = task.suspend :running
+      if r.kind_of? Error
+        puts "GOT SOME SORT OF ERROR: #{r}"
+        raise r
+      end
+      r
     end
 
     def get_response
@@ -1441,27 +1452,27 @@ module Celluloid::Net
     end
 
     def send_command(cmd, *args)
-        args.each do |i|
-          validate_data(i)
-        end
-        tag = generate_tag
-        put_string(tag + " " + cmd)
-        args.each do |i|
-          put_string(" ")
-          send_data(i)
-        end
-        put_string(CRLF)
-        if cmd == "LOGOUT"
-          @logout_command_tag = tag
-        end
+      args.each do |i|
+        validate_data(i)
+      end
+      tag = generate_tag
+      put_string(tag + " " + cmd)
+      args.each do |i|
+        put_string(" ")
+        send_data(i)
+      end
+      put_string(CRLF)
+      if cmd == "LOGOUT"
+        @logout_command_tag = tag
+      end
 
-        results = get_tagged_response(tag, cmd)
-      puts "GOT RESPONSE: #{results}"
-        if results.kind_of? Error
-          puts "COMMAND EXCEPTION, DELIVERING"
-          raise results
-          return nil
-        end
+      results = get_tagged_response(tag, cmd)
+      puts "GOT RESPONSE: #{results}" if @@debug
+      if results.kind_of? Error
+        puts "COMMAND EXCEPTION, DELIVERING" if @@debug
+        raise results
+        return nil
+      end
       return results
     end
 
