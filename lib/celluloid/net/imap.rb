@@ -336,9 +336,11 @@ module Celluloid::Net
       begin
         begin
           # try to call SSL::SSLSocket#io.
+          puts "SOCKET CLOSE - 2"
           @sock.io.close
         rescue NoMethodError
           # @sock is not an SSL::SSLSocket.
+          puts "SOCKET CLOSE -2a"
           @sock.close
         end
       rescue Errno::ENOTCONN
@@ -987,50 +989,65 @@ module Celluloid::Net
       # command model fix described above needs to be done.
 
       loop do
+        puts "IDLE looping..."
         tag = generate_tag
         
-
         task = Celluloid::Task.current
-        
-        handler = lambda do |response|
-          # filter out any tagged responses: IDLE updates are only untagged.
-          if response.instance_of?(UntaggedResponse)
-            idle_handler.call response
-          end
-        end
 
-        add_response_handler handler
-
-        put_string("#{tag} IDLE#{CRLF}")
-
-        # TODO: registering of continuation handlers should be factored
-        # out
-        @outstanding_requests[tag] = lambda do |response|
-          # received the idle terminated message
-          if response.name != "IDLE"
-            raise BadResponseError, "Got #{response.name} response from server's IDLE continuation?"
+        begin
+          
+          handler = lambda do |response|
+            # filter out any tagged responses: IDLE updates are only untagged.
+            if response.instance_of?(UntaggedResponse)
+              idle_handler.call response
+            end
           end
 
-          # we're the only thing consuming untagged responses, and and
-          # as such we don't need them buffered up
-          @responses.clear
+          add_response_handler handler
 
-          # TODO: is this is going to cause stack expansion, because
-          # subsequent iterations will pass through this closure,
-          # causing stack nesting?  depends if nested Fiber.resume-ing
-          # is going to add stack frames (fibers have their own
-          # stacks)
+          put_string("#{tag} IDLE#{CRLF}")
 
-          # yield the task back, and continue back at the resume
-          # task.suspend invocation below (from that t.resume there)
-          task.resume
+          # TODO: registering of continuation handlers should be factored
+          # out
+          @outstanding_requests[tag] = lambda do |response|
+            puts "OUTSANDING RESPONSE HANDLER (IDLE version) HIT: #{response}"
+            # received the idle terminated message
+            if response.name != "IDLE"
+              # emitting this exception here is wrong -- we're getting
+              # called by Celluloid on reception of data, so the
+              # exception goes there, which is not desirable and usually
+              # bodges up the whole works pretty bad.  the connection
+              # should be canned and this error should be delivered to
+              # the @closed_handler
+              # raise BadResponseError.new response
+              task.resume BadResponseError.new(response)
+              return
+            end
+
+            # we're the only thing consuming untagged responses, and and
+            # as such we don't need them buffered up
+            @responses.clear
+
+            # TODO: is this is going to cause stack expansion, because
+            # subsequent iterations will pass through this closure,
+            # causing stack nesting?  depends if nested Fiber.resume-ing
+            # is going to add stack frames (fibers have their own
+            # stacks)
+
+            # yield the task back, and continue back at the resume
+            # task.suspend invocation below (from that t.resume there)
+            task.resume
+          end
+
+        rescue Exception => e
+          task.resume e
+          break
         end
 
         # TODO: implement the 28 minute timeout for benefit of the API
         # consumer ... also Do we actually need to terminate IDLE
         # after each arrival?
-
-        # put_string("DONE#{CRLF}")
+        # 
 
         # TODO: handle the socket straight-up dying
 
@@ -1038,10 +1055,19 @@ module Celluloid::Net
 
         
         # we'll wait for this the IDLE termination handler to be fired before we loop again
-        task.suspend :running
+        r = task.suspend :running
+
+        puts "GOT IDLE LOOP RESULT: #{r}"
+        if r.kind_of? Error
+          puts "IDLE EXCEPTION, DELIVERING"
+          raise r
+          return
+        end
 
         # ... and now, we got an IDLE termination message.  Thus,
         # reloop and reengage the request.
+
+        # put_string("DONE#{CRLF}")
 
         remove_response_handler handler
 
@@ -1210,18 +1236,19 @@ module Celluloid::Net
       # actor.async.wrap {
       #   
       # }
-      @receiver_thread_terminating = false
 
       create_task do
         begin
           receive_responses
           # if receive_responses exits, then consider the connection dead
           disconnect
-          @closed_handler.call(e)
+          @closed_handler.call(e) unless @closed_handler.nil?
+          @closed_handler = nil
         rescue Exception => e
           puts e
           # disconnect
-          @closed_handler.call(e)
+          @closed_handler.call(e) unless @closed_handler.nil?
+          @closed_handler = nil
          end
        end
     end
@@ -1243,6 +1270,7 @@ module Celluloid::Net
           resp = get_response
         rescue Exception => e
           synchronize do
+            puts "CLOSING SOCKET - 1"
             @sock.close
             raise e
           end
@@ -1258,7 +1286,9 @@ module Celluloid::Net
             when TaggedResponse
               outstanding = @outstanding_requests.delete(resp.tag)
 
+              puts "CALLING OUTSTANDING RESPONSE #{outstanding}"
               outstanding.call resp
+              puts "FINISHED CALLING OUTSTANDING"
 
               # OPTIONAL HACK If client code in another task tries to
               # close the connection, receive_responses may stay
@@ -1334,12 +1364,14 @@ module Celluloid::Net
           puts "Unmanageable connection problem: #{e} - #{e.backtrace.join "\n"}"
           # Any unhandled exceptions should cause the connection to
           # fail.
-          raise e
+          disconnect
+          @closed_handler.call e unless @closed_handler.nil?
+          @closed_handler = nil
+          # raise e
          end
       end
       synchronize do
         # shutting down!
-        @receiver_thread_terminating = true
         # TODO shut down any IDLE
       end
     end
@@ -1351,18 +1383,26 @@ module Celluloid::Net
 
       task = Celluloid::Task.current
 
-      @outstanding_requests[tag] = lambda do |response|
-        # TODO: looks like the response object here sometimes lacks
-        # the "data" field, breaking the Response instantiation.
-        # example: try starting IDLE before LOGIN
-        case response.name
-        when /\A(?:NO)\z/ni
-          task.resume NoResponseError.new response
-        when /\A(?:BAD)\z/ni
-          task.resume BadResponseError.new response
-        else
-          task.resume(response)
+      begin
+
+        @outstanding_requests[tag] = lambda do |response|
+          # TODO: looks like the response object here sometimes lacks
+          # the "data" field, breaking the Response instantiation.
+          # example: try starting IDLE before LOGIN
+          puts "OUTSTANDING RESPONSE HANDLER HIT: #{response}"
+          case response.name
+          when /\A(?:NO)\z/ni
+            task.resume NoResponseError.new(response)
+          when /\A(?:BAD)\z/ni
+            puts "GOT BAD ERROR: #{response}"
+            task.resume BadResponseError.new(response)
+          else
+            task.resume(response)
+          end
         end
+
+      rescue Exception => e
+        task.resume(e)
       end
 
       task.suspend :running
@@ -1416,6 +1456,7 @@ module Celluloid::Net
         end
 
         results = get_tagged_response(tag, cmd)
+      puts "GOT RESPONSE: #{results}"
         if results.kind_of? Error
           puts "COMMAND EXCEPTION, DELIVERING"
           raise results
