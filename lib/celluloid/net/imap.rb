@@ -1203,6 +1203,20 @@ module Celluloid::Net
       rescue Resolv::ResolvError, SystemCallError, SocketError => e
         raise NetworkError, e
       end
+
+      @sock.setsockopt(Socket::SOL_SOCKET, Socket::SO_KEEPALIVE, true)
+
+      # While OS X finally gained TCP_KEEPIDLE and TCP_KEEPINTVL in
+      # Mountain Lion, current Mac builds of Ruby assume they're not
+      # there.
+
+      if Socket.constants.include?(:TCP_KEEPIDLE) and Socket.constants.include?(:TCP_KEEPINTVL)
+        @sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_KEEPIDLE, 300)
+        @sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_KEEPINTVL, 300)
+      else
+        puts "Celluloid::Net::IMAP on an OS (OS X, likely) without KEEPIDLE and KEEPINTVL socket options available in Ruby, cannot set them."
+      end
+
       if options[:ssl]
         start_tls_session(options[:ssl])
         @usessl = true
