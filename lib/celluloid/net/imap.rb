@@ -997,73 +997,66 @@ module Celluloid::Net
       # command model fix described above needs to be done.
 
       loop do
-        puts "IDLE looping..." if @@debug
+        puts "Looping IDLE..." if @@debug
         tag = generate_tag
         
         task = Celluloid::Task.current
 
-        begin
-          
-          handler = lambda do |response|
-            # filter out any tagged responses: IDLE updates are only untagged.
-            if response.instance_of?(UntaggedResponse)
-              idle_handler.call response
-            end
+        handler = lambda do |response|
+          # filter out any tagged responses: IDLE updates are only untagged.
+          if response.instance_of?(UntaggedResponse)
+            idle_handler.call response
           end
-
-          add_response_handler handler
-
-          put_string("#{tag} IDLE#{CRLF}")
-
-          # TODO: registering of continuation handlers should be factored
-          # out
-          @outstanding_requests[tag] = lambda do |response|
-            puts "OUTSANDING RESPONSE HANDLER (IDLE version) HIT: #{response}"
-            # received the idle terminated message
-            if response.name != "IDLE"
-              # emitting this exception here is wrong -- we're getting
-              # called by Celluloid on reception of data, so the
-              # exception goes there, which is not desirable and usually
-              # bodges up the whole works pretty bad.  the connection
-              # should be canned and this error should be delivered to
-              # the @closed_handler
-              # raise BadResponseError.new response
-              task.resume BadResponseError.new(response)
-              return
-            end
-
-            # we're the only thing consuming untagged responses, and and
-            # as such we don't need them buffered up
-            @responses.clear
-
-            # TODO: is this is going to cause stack expansion, because
-            # subsequent iterations will pass through this closure,
-            # causing stack nesting?  depends if nested Fiber.resume-ing
-            # is going to add stack frames (fibers have their own
-            # stacks)
-
-            # yield the task back, and continue back at the resume
-            # task.suspend invocation below (from that t.resume there)
-            task.resume
-          end
-
-        rescue Exception => e
-          task.resume e
-          break
         end
 
-        # TODO: implement the 28 minute timeout for benefit of the API
-        # consumer ... also Do we actually need to terminate IDLE
-        # after each arrival?
-        # 
+        add_response_handler handler
 
-        # TODO: handle the socket straight-up dying
+        put_string("#{tag} IDLE#{CRLF}")
+
+        # TODO: registering of continuation handlers should be factored
+        # out
+        @outstanding_requests[tag] = lambda do |response|
+          puts "OUTSTANDING RESPONSE HANDLER (IDLE version) HIT: #{response}"
+          # received the idle terminated message
+          if response.name != "OK"
+            # emitting this exception here is wrong -- we're getting
+            # called by Celluloid on reception of data, so the
+            # exception goes there, which is not desirable and usually
+            # bodges up the whole works pretty bad.  the connection
+            # should be canned and this error should be delivered to
+            # the @closed_handler
+            # raise BadResponseError.new response
+            task.resume BadResponseError.new(response)
+            return
+          end
+
+          # OK, back out of IDLE mode.
+
+          # we're the only thing consuming untagged responses, and and
+          # as such we don't need them buffered up
+          @responses.clear
+          
+          # TODO: is this is going to cause stack expansion, because
+          # subsequent iterations will pass through this closure,
+          # causing stack nesting?  depends if nested Fiber.resume-ing
+          # is going to add stack frames (fibers have their own
+          # stacks)
+
+          # yield the task back, and continue back at the resume
+          # task.suspend invocation below (from that t.resume there)
+          task.resume
+        end
 
         # how can I cancel it externally?
 
+        restarter = @actor.after (26 * 60) do
+          idle_done
+        end
         
         # we'll wait for this the IDLE termination handler to be fired before we loop again
         r = task.suspend :running
+
+        restarter.cancel
 
         puts "GOT IDLE LOOP RESULT: #{r}"
         if r.kind_of? Error
@@ -1078,13 +1071,13 @@ module Celluloid::Net
         # put_string("DONE#{CRLF}")
 
         remove_response_handler handler
-
       end
     end
 
     # Leaves IDLE.
     def idle_done
-      raise NotImplementedError
+      # TODO: for now, this will just cause IDLE to restart.
+      put_string("DONE#{CRLF}")
     end
 
     # Decode a string from modified UTF-7 format to UTF-8.
