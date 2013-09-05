@@ -2,7 +2,7 @@
 # = net/imap.rb
 #
 # Copyright (C) 2000  Shugo Maeda <shugo@ruby-lang.org>
-#               2013  Openera Inc. <alc@openera.org>
+#               2013  Openera Inc. <alc@openera.com>
 #
 # This library is distributed under the terms of the Ruby license.
 # You can freely distribute/modify this library.
@@ -996,8 +996,8 @@ module Celluloid::Net
       until @idle_stopped
         puts "Looping IDLE..." if @@debug
         tag = generate_tag
-        
-        task = Celluloid::Task.current
+
+        cond = Celluloid::Condition.new
 
         handler = lambda do |response|
           # filter out any tagged responses: IDLE updates are only untagged.
@@ -1018,7 +1018,7 @@ module Celluloid::Net
           # nil if the connection has been closed.
           if response.nil?
             @idle_stopped = true
-            task.resume nil
+            cond.signal nil
           elsif response.name != "OK"
             # emitting this exception here is wrong -- we're getting
             # called by Celluloid on reception of data, so the
@@ -1027,7 +1027,7 @@ module Celluloid::Net
             # should be canned and this error should be delivered to
             # the @closed_handler
             # raise BadResponseError.new response
-            task.resume BadResponseError.new(response)
+            cond.signal BadResponseError.new(response)
             @idle_stopped = true
           end
 
@@ -1045,7 +1045,7 @@ module Celluloid::Net
 
           # yield the task back, and continue back at the resume
           # task.suspend invocation below (from that t.resume there)
-          task.resume
+          cond.signal
         end
 
         # how can I cancel it externally?
@@ -1055,7 +1055,7 @@ module Celluloid::Net
         end
         
         # we'll wait for this the IDLE termination handler to be fired before we loop again
-        r = task.suspend :running
+        r = cond.wait
 
         restarter.cancel
 
@@ -1399,7 +1399,7 @@ module Celluloid::Net
       # TODO wrap the core connection and response wait list into a thread
       # safe tiny object?  The great refactor!
 
-      task = Celluloid::Task.current
+      cond = Celluloid::Condition.new
 
       @outstanding_requests[tag] = lambda do |response|
         # TODO: looks like the response object here sometimes lacks
@@ -1407,21 +1407,21 @@ module Celluloid::Net
         # example: try starting IDLE before LOGIN
         puts "OUTSTANDING RESPONSE (for #{tag}-#{cmd}) HANDLER HIT: #{response}" if @@debug
         if response.nil?
-          task.resume(nil)
+          cond.signal(nil)
         else
           case response.name
           when /\A(?:NO)\z/ni
-            task.resume NoResponseError.new(response)
+            cond.signal NoResponseError.new(response)
           when /\A(?:BAD)\z/ni
             puts "GOT BAD ERROR: #{response}"
-            task.resume BadResponseError.new(response)
+            cond.signal BadResponseError.new(response)
           else
-            task.resume(response)
+            cond.signal(response)
           end
         end
       end
 
-      r = task.suspend :running
+      r = cond.wait
       if r.kind_of? Error
         puts "GOT SOME SORT OF ERROR: #{r}"
         raise r
