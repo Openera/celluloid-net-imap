@@ -68,9 +68,16 @@ class TestListener
 
       # puts "You have #{email_uids.length} messages in your INBOX."
 
+      puts "Starting idle..."
       conn.idle do |idle_msg|
         puts "GOT IDLE MESSAGE: #{idle_msg.inspect}"
+
+
+
       end
+
+      puts "Idle finished?"
+
     rescue Exception => e
       puts "Command error (auth?), (restarting): #{e}, #{e.backtrace}"
 
@@ -80,7 +87,7 @@ class TestListener
       # solved.
 
       # disconnecting WOULD trigger a reconnect for us
-      conn.disconnect
+      # conn.disconnect
     end
   end
  

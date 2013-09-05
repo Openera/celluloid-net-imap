@@ -336,12 +336,12 @@ module Celluloid::Net
       begin
         begin
           # try to call SSL::SSLSocket#io.
-          puts "SOCKET CLOSE - 2"
-          @sock.io.close
+          puts "SOCKET CLOSE (ssl)"
+          @sock.io.close unless @sock.io.closed?
         rescue NoMethodError
           # @sock is not an SSL::SSLSocket.
-          puts "SOCKET CLOSE -2a"
-          @sock.close
+          puts "SOCKET CLOSE (non-ssl)"
+          @sock.close unless @sock.closed?
         end
       rescue Errno::ENOTCONN
         # ignore `Errno::ENOTCONN: Socket is not connected' on some platforms.
@@ -358,7 +358,7 @@ module Celluloid::Net
 
       @outstanding_requests.clear
   
-      puts "Disconnect complete!"
+      puts "Disconnect complete!" if @@debug
     end
 
     # Returns true if disconnected from the server.
@@ -996,7 +996,9 @@ module Celluloid::Net
       # tasks calling command requests, outside of just IDLE)... ie.,
       # command model fix described above needs to be done.
 
-      loop do
+      @idle_stopped = false
+
+      until @idle_stopped
         puts "Looping IDLE..." if @@debug
         tag = generate_tag
         
@@ -1016,9 +1018,13 @@ module Celluloid::Net
         # TODO: registering of continuation handlers should be factored
         # out
         @outstanding_requests[tag] = lambda do |response|
-          puts "OUTSTANDING RESPONSE HANDLER (IDLE version) HIT: #{response}"
-          # received the idle terminated message
-          if response.name != "OK"
+          puts "OUTSTANDING RESPONSE HANDLER (IDLE version) HIT: #{response}" if @@debug
+          # received the idle terminated message response.  could be
+          # nil if the connection has been closed.
+          if response.nil?
+            @idle_stopped = true
+            task.resume nil
+          elsif response.name != "OK"
             # emitting this exception here is wrong -- we're getting
             # called by Celluloid on reception of data, so the
             # exception goes there, which is not desirable and usually
@@ -1027,7 +1033,7 @@ module Celluloid::Net
             # the @closed_handler
             # raise BadResponseError.new response
             task.resume BadResponseError.new(response)
-            return
+            @idle_stopped = true
           end
 
           # OK, back out of IDLE mode.
@@ -1049,7 +1055,7 @@ module Celluloid::Net
 
         # how can I cancel it externally?
 
-        restarter = @actor.after (26 * 60) do
+        restarter = @actor.after (26) do
           idle_done
         end
         
@@ -1058,9 +1064,9 @@ module Celluloid::Net
 
         restarter.cancel
 
-        puts "GOT IDLE LOOP RESULT: #{r}"
+        puts "GOT IDLE LOOP RESULT: #{r}" if @@debug
         if r.kind_of? Error
-          puts "IDLE EXCEPTION, DELIVERING"
+          puts "IDLE EXCEPTION, DELIVERING" if @@debug
           raise r
           return
         end
@@ -1077,7 +1083,9 @@ module Celluloid::Net
     # Leaves IDLE.
     def idle_done
       # TODO: for now, this will just cause IDLE to restart.
-      put_string("DONE#{CRLF}")
+      command_try do
+        put_string("DONE#{CRLF}")
+      end
     end
 
     # Decode a string from modified UTF-7 format to UTF-8.
@@ -1402,7 +1410,7 @@ module Celluloid::Net
         # TODO: looks like the response object here sometimes lacks
         # the "data" field, breaking the Response instantiation.
         # example: try starting IDLE before LOGIN
-        puts "OUTSTANDING RESPONSE HANDLER HIT: #{response}" if @@debug
+        puts "OUTSTANDING RESPONSE (for #{tag}-#{cmd}) HANDLER HIT: #{response}" if @@debug
         if response.nil?
           task.resume(nil)
         else
@@ -1459,18 +1467,21 @@ module Celluloid::Net
     end
 
     def send_command(cmd, *args)
-      args.each do |i|
-        validate_data(i)
-      end
-      tag = generate_tag
-      put_string(tag + " " + cmd)
-      args.each do |i|
-        put_string(" ")
-        send_data(i)
-      end
-      put_string(CRLF)
-      if cmd == "LOGOUT"
-        @logout_command_tag = tag
+      tag = nil
+      command_try(true) do
+        args.each do |i|
+          validate_data(i)
+        end
+        tag = generate_tag
+        put_string(tag + " " + cmd)
+        args.each do |i|
+          put_string(" ")
+          send_data(i)
+        end
+        put_string(CRLF)
+        if cmd == "LOGOUT"
+          @logout_command_tag = tag
+        end
       end
 
       results = get_tagged_response(tag, cmd)
@@ -1519,6 +1530,21 @@ module Celluloid::Net
       when Symbol
       else
         data.validate
+      end
+    end
+
+    # Handle either Socket errors or protocol errors by shutting down
+    # the connection
+    def command_try(raise_exception = false)
+      begin
+        return yield
+      rescue Exception => e
+        puts "Problem doing IMAP action (#{e}), connection is now toast." # if @@debug
+        disconnect
+        @closed_handler.call(e) unless @closed_handler.nil?
+        @closed_handler = nil
+        raise e if raise_exception
+        return e
       end
     end
 
