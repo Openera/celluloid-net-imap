@@ -19,17 +19,12 @@ require "net/imap"
 
 # Celluloid::IO async porting notes:
 
-# * have to lose all condvars: they can deadlock with interleaved
-#   Fibers because the thing that will signal them will never be
-#   scheduled
-# * some protocol state/ordering seems to be enforced with condvars :(
-# * how to deliver errors to client code?
-# * would be nice, instead of yielding everywhere, to use line-level
-#   continuations (fibers) like I know C::IO can do, if only to have
-# exceptions work better
+# * some protocol state/ordering seems to have been enforced with
+#   condvars.  Consumers have be very careful what they call while
+#   other stuff is outstanding, for now. :(
+# * The upcoming Celluloid "Cell" class will be very useful when it
+#   drops.
 
-
-# require "socket"
 require "monitor"
 require "digest/md5"
 require "strscan"
@@ -1055,7 +1050,7 @@ module Celluloid::Net
 
         # how can I cancel it externally?
 
-        restarter = @actor.after (26) do
+        restarter = @actor.after (26 * 60) do
           idle_done
         end
         
