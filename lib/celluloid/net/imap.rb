@@ -439,15 +439,23 @@ module Celluloid::Net
           format('unknown auth type - "%s"', auth_type)
       end
       authenticator = @@authenticators[auth_type].new(*args)
-      # TODO: because of the continuation request pump method I put
-      # in, the client code is not able to receive any data included
-      # with the continuation request.  Thankfully, all of the auth
-      # methods we use (I suspect CRAM-MD5 is the only one) don't need
-      # it, hence `nil'.
-      auth_data = authenticator.process(nil)
-      base64_packed = [auth_data].pack("m").gsub(/\n/, "")
-      queue_continuation_request_data(base64_packed)
-      send_command("AUTHENTICATE", auth_type)
+      # the continuation pump will attempt to emit something, but it
+      # should be dry at this point: we handle pumping the
+      # continuation data manually below, with the goal of allowing
+      # the Authenticator to build a response using whatever data was
+      # included with the continuation request.  Really, the
+      # continuation pump needs to be replaced with a proper
+      # delegation to some sort of command state object.
+      @queued_continuation_request_data.clear
+     
+      send_command("AUTHENTICATE", auth_type) do |resp|
+        case resp
+        when ContinuationRequest
+          auth_data = authenticator.process(resp)
+          base64_packed = [auth_data].pack("m").gsub(/\n/, "")
+          put_string("#{base64_packed}#{CRLF}")
+        end
+      end
     end
 
     # Sends a LOGIN command to identify the client and carries
@@ -1051,11 +1059,13 @@ module Celluloid::Net
         # how can I cancel it externally?
 
         restarter = @actor.after (26 * 60) do
-          idle_done
+          idle_done(true)
         end
         
         # we'll wait for this the IDLE termination handler to be fired before we loop again
         r = cond.wait
+
+        @idle_stopped = true
 
         restarter.cancel
 
@@ -1076,7 +1086,8 @@ module Celluloid::Net
     end
 
     # Leaves IDLE.
-    def idle_done
+    def idle_done(restart = false)
+      @idle_stopped = !restart
       # TODO: for now, this will just cause IDLE to restart.
       command_try do
         put_string("DONE#{CRLF}")
@@ -1461,7 +1472,7 @@ module Celluloid::Net
       @responses[name].push(data)
     end
 
-    def send_command(cmd, *args)
+    def send_command(cmd, *args, &block)
       tag = nil
       command_try(true) do
         args.each do |i|
@@ -1479,7 +1490,16 @@ module Celluloid::Net
         end
       end
 
+      if block
+        add_response_handler(block)
+      end
+
       results = get_tagged_response(tag, cmd)
+
+      if block
+        remove_response_handler(block)
+      end
+
       puts "GOT RESPONSE: #{results}" if @@debug
       if results.kind_of? Error
         puts "COMMAND EXCEPTION, DELIVERING" if @@debug
@@ -1594,10 +1614,12 @@ module Celluloid::Net
       @queued_continuation_request_data.push(data)
     end
 
-    # pump one continuation dataum up the pipe.
+    # pump one continuation dataum up the pipe in response to a
+    # continuation request.
     #
     # TODO: this arrangement does not make the rest of the
-    # continuation request message available to the producer of it.
+    # continuation request message available to the producer of it; it
+    # should be delegating to some sort of command state object.
     def pump_continuation()
       r = @queued_continuation_request_data.shift
       if not r.nil?
