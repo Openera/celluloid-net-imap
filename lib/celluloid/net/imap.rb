@@ -1016,72 +1016,75 @@ module Celluloid::Net
 
         add_response_handler handler
 
-        put_string("#{tag} IDLE#{CRLF}")
+        command_try do
 
-        # TODO: registering of continuation handlers should be factored
-        # out
-        @outstanding_requests[tag] = lambda do |response|
-          puts "OUTSTANDING RESPONSE HANDLER (IDLE version) HIT: #{response}" if @@debug
-          # received the idle terminated message response.  could be
-          # nil if the connection has been closed.
-          if response.nil?
-            @idle_stopped = true
-            cond.signal nil
-          elsif response.name != "OK"
-            # emitting this exception here is wrong -- we're getting
-            # called by Celluloid on reception of data, so the
-            # exception goes there, which is not desirable and usually
-            # bodges up the whole works pretty bad.  the connection
-            # should be canned and this error should be delivered to
-            # the @closed_handler
-            # raise BadResponseError.new response
-            cond.signal BadResponseError.new(response)
-            @idle_stopped = true
+          put_string("#{tag} IDLE#{CRLF}")
+
+          # TODO: registering of continuation handlers should be factored
+          # out
+          @outstanding_requests[tag] = lambda do |response|
+            puts "OUTSTANDING RESPONSE HANDLER (IDLE version) HIT: #{response}" if @@debug
+            # received the idle terminated message response.  could be
+            # nil if the connection has been closed.
+            if response.nil?
+              @idle_stopped = true
+              cond.signal nil
+            elsif response.name != "OK"
+              # emitting this exception here is wrong -- we're getting
+              # called by Celluloid on reception of data, so the
+              # exception goes there, which is not desirable and usually
+              # bodges up the whole works pretty bad.  the connection
+              # should be canned and this error should be delivered to
+              # the @closed_handler
+              # raise BadResponseError.new response
+              cond.signal BadResponseError.new(response)
+              @idle_stopped = true
+            end
+
+            # OK, back out of IDLE mode.
+
+            # we're the only thing consuming untagged responses, and and
+            # as such we don't need them buffered up
+            @responses.clear
+            
+            # TODO: is this is going to cause stack expansion, because
+            # subsequent iterations will pass through this closure,
+            # causing stack nesting?  depends if nested Fiber.resume-ing
+            # is going to add stack frames (fibers have their own
+            # stacks)
+
+            # yield the task back, and continue back at the resume
+            # task.suspend invocation below (from that t.resume there)
+            cond.signal
           end
 
-          # OK, back out of IDLE mode.
+          # how can I cancel it externally?
 
-          # we're the only thing consuming untagged responses, and and
-          # as such we don't need them buffered up
-          @responses.clear
+          restarter = @actor.after (26 * 60) do
+            idle_done(true)
+          end
           
-          # TODO: is this is going to cause stack expansion, because
-          # subsequent iterations will pass through this closure,
-          # causing stack nesting?  depends if nested Fiber.resume-ing
-          # is going to add stack frames (fibers have their own
-          # stacks)
+          # we'll wait for this the IDLE termination handler to be fired before we loop again
+          r = cond.wait
 
-          # yield the task back, and continue back at the resume
-          # task.suspend invocation below (from that t.resume there)
-          cond.signal
+          @idle_stopped = true
+
+          restarter.cancel
+
+          puts "GOT IDLE LOOP RESULT: #{r}" if @@debug
+          if r.kind_of? Error
+            puts "IDLE EXCEPTION, DELIVERING" if @@debug
+            raise r
+            return
+          end
+
+          # ... and now, we got an IDLE termination message.  Thus,
+          # reloop and reengage the request.
+
+          # put_string("DONE#{CRLF}")
+
+          remove_response_handler handler
         end
-
-        # how can I cancel it externally?
-
-        restarter = @actor.after (26 * 60) do
-          idle_done(true)
-        end
-        
-        # we'll wait for this the IDLE termination handler to be fired before we loop again
-        r = cond.wait
-
-        @idle_stopped = true
-
-        restarter.cancel
-
-        puts "GOT IDLE LOOP RESULT: #{r}" if @@debug
-        if r.kind_of? Error
-          puts "IDLE EXCEPTION, DELIVERING" if @@debug
-          raise r
-          return
-        end
-
-        # ... and now, we got an IDLE termination message.  Thus,
-        # reloop and reengage the request.
-
-        # put_string("DONE#{CRLF}")
-
-        remove_response_handler handler
       end
     end
 
