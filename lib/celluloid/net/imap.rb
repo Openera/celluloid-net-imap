@@ -1147,6 +1147,12 @@ module Celluloid::Net
     @@authenticators = {}
     @@max_flag_count = 10000
 
+    def disconnect_inform(e = nil)
+      handler = @closed_handler
+      @closed_handler = nil
+      handler.call(e) unless handler.nil?
+    end
+
     # :call-seq:
     #    Net::IMAP.new(host, task_delegator, options = {})
     #
@@ -1273,14 +1279,13 @@ module Celluloid::Net
         begin
           receive_responses
           # if receive_responses exits, then consider the connection dead
+          # TODO: should disconnect() itself call disconnect_inform?
           disconnect
-          @closed_handler.call(e) unless @closed_handler.nil?
-          @closed_handler = nil
+          disconnect_inform()
         rescue Exception => e
           puts e
           # disconnect
-          @closed_handler.call(e) unless @closed_handler.nil?
-          @closed_handler = nil
+          disconnect_inform(e)
          end
        end
     end
@@ -1397,8 +1402,7 @@ module Celluloid::Net
           # Any unhandled exceptions should cause the connection to
           # fail.
           disconnect
-          @closed_handler.call e unless @closed_handler.nil?
-          @closed_handler = nil
+          disconnect_inform(e)
           # raise e
          end
       end
@@ -1559,8 +1563,7 @@ module Celluloid::Net
       rescue Exception => e
         puts "Problem doing IMAP action (#{e}), connection is now toast." # if @@debug
         disconnect
-        @closed_handler.call(e) unless @closed_handler.nil?
-        @closed_handler = nil
+        disconnect_inform(e)
         raise e if raise_exception
         return e
       end
@@ -1608,7 +1611,7 @@ module Celluloid::Net
       put_string("{" + str.bytesize.to_s + "}" + CRLF)
       
       queue_continuation_request_data(str)
-      raise @exception if @exception
+      raise @exception if @exception # TODO: this should probably go away?
     end
 
     # Queue up data that should be sent on subsequent `+` continuation
