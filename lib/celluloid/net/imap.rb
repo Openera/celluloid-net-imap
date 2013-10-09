@@ -331,12 +331,12 @@ module Celluloid::Net
       begin
         begin
           # try to call SSL::SSLSocket#io.
-          puts "SOCKET CLOSE (ssl)"
           @sock.io.close unless @sock.io.closed?
+          puts "SOCKET CLOSE (ssl)" if @@debug
         rescue NoMethodError
           # @sock is not an SSL::SSLSocket.
-          puts "SOCKET CLOSE (non-ssl)"
           @sock.close unless @sock.closed?
+          puts "SOCKET CLOSE (non-ssl)" if @@debug
         end
       rescue Errno::ENOTCONN
         # ignore `Errno::ENOTCONN: Socket is not connected' on some platforms.
@@ -347,11 +347,13 @@ module Celluloid::Net
 
       # stop all blocked tasks waiting for commands to complete.
       # their world is over.
-      @outstanding_requests.values.each do |outstanding_cb|
+
+      outstandings = [].replace(@outstanding_requests.values)
+      @outstanding_requests.clear
+
+      outstandings.each do |outstanding_cb|
         outstanding_cb.call(nil)
       end
-
-      @outstanding_requests.clear
   
       puts "Disconnect complete!" if @@debug
     end
@@ -1054,7 +1056,7 @@ module Celluloid::Net
             # stacks)
 
             # yield the task back, and continue back at the resume
-            # task.suspend invocation below (from that t.resume there)
+            # task.suspend invocation below (from that cond.wait there)
             cond.signal
           end
 
@@ -1441,7 +1443,7 @@ module Celluloid::Net
 
       r = cond.wait
       if r.kind_of? Error
-        puts "GOT SOME SORT OF ERROR: #{r}"
+        puts "GOT SOME SORT OF ERROR: #{r}" if @@debug
         raise r
       end
       r
